@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Run the real-time indexing benchmark and produce the memory report.
+
+Flow: start Qdrant → start the streaming serviette indexer
+and server → sample total RSS/PSS and per-process memory every few seconds
+until indexing is complete → replay accuracy questions through /api/v1
+retrieve endpoint → write a memory-over-time plot, a CSV, and a JSON summary
+into ./results.
+
+Usage:
+    python run_bench.py --size 100mb [--keep-up]
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import httpx
+
+ROOT = Path(__file__).parent
+
+
+class _ParsingProgress:
+    """Observe cold-run input progress without entering the measured container."""
+
+    def __init__(self, container):
+        self.container = container
+        self.parsed_documents = 0
+        self.failed_documents = 0
+        self.last_change = 0.0
+        self.reader_error = None
+
+    def _observe(self, line):
+        if b'INFO:serviette.indexer.graph:parsed ' in line:
+            self.parsed_documents += 1
+            self.last_change = time.monotonic()
+        elif b'document is indexed as EMPTY' in line:
+            self.failed_documents += 1
+
+    def _read(self):
+        try:
+            for line in self.process.stdout:
+                self._observe(line)
+        except (OSError, ValueError) as exc:
+            self.reader_error = str(exc)
+
+    def __enter__(self):
+        self.process = subprocess.Popen(
+            ['docker', 'logs', '--follow', self.container],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        return self
+
+    def __exit__(self, *_):
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        self.reader.join(timeout=10)
+        self.process.stdout.close()
+
+
+def _ready_to_finish(*, documents, parsed_documents, chunks, last_change,
+                     last_busy, now, stats_available):
+    # A chunk-rich subset can exceed the number of input files. Require every
+    # file to have reached parsing before applying the existing quiet window.
+    return (stats_available and parsed_documents >= documents and chunks >= documents
+            and now - last_change >= STABLE_WINDOW
+            and now - last_busy >= STABLE_WINDOW)
+
+# Observe the same processes as the aggregate sampler, with worker ranks so
+# chart components can be traced to measurements. Never record full environs
+# or command lines: they may contain credentials.
+PROC_SAMPLE = r'''
+import json, os
+from pathlib import Path
+rows = []
+for proc in Path('/proc').iterdir():
+    if not proc.name.isdigit() or int(proc.name) == os.getpid():
+        continue
+    try:
+        env = dict(item.split(b'=', 1) for item in (proc / 'environ').read_bytes().split(b'\0') if b'=' in item)
+        row = {'pid': int(proc.name), 'worker_rank': int(env[b'PATHWAY_PROCESS_ID']) if b'PATHWAY_PROCESS_ID' in env else None}
+        for filename in ('status', 'smaps_rollup'):
+            for line in (proc / filename).read_text().splitlines():
+                if line.startswith(('VmRSS:', 'VmHWM:', 'Pss:', 'Private_Clean:', 'Private_Dirty:')):
+                    key, value = line.split(':', 1)
+                    row[key] = int(value.split()[0])
+        # File mappings identify shared local-embedding libraries. Anonymous
+        # allocations require a separate controlled initialization measurement.
+        groups = {'embedding': {'Pss': 0, 'private_kb': 0},
+                  'other': {'Pss': 0, 'private_kb': 0}}
+        group = 'other'
+        for line in (proc / 'smaps').read_text().splitlines():
+            parts = line.split()
+            if parts and '-' in parts[0] and ':' not in parts[0]:
+                path = parts[-1] if len(parts) >= 6 else ''
+                group = 'embedding' if any(part in path for part in
+                    ('/torch/', '/nvidia/', '/triton/', '/sentence_transformers/', '/tokenizers/', '/safetensors/',
+                     '/models--sentence-transformers--static-retrieval-mrl-en-v1/')) else 'other'
+            elif line.startswith('Pss:'):
+                groups[group]['Pss'] += int(parts[1])
+            elif line.startswith(('Private_Clean:', 'Private_Dirty:')):
+                groups[group]['private_kb'] += int(parts[1])
+        row['mapping_groups'] = groups
+        rows.append(row)
+    except (OSError, ValueError):
+        continue
+print(json.dumps(rows))
+'''
+SAMPLE_INTERVAL = 3.0
+# Streaming never exits; indexing is "done" when BOTH hold for this long:
+# the chunk counter stopped growing AND the indexer's CPU dropped to idle.
+# (Chunk commits are bursty — the embedding backlog of a large commit can
+# delay the next flush arbitrarily — but during that backlog the CPU burns
+# dozens of cores, so the combination is unambiguous.)
+STABLE_WINDOW = 180.0
+# Below this sustained CPU rate the indexer counts as idle. Must sit between
+# the streaming re-scan hum (the fs connector continuously re-stats every
+# file: ~5 cores per 240k files) and the embedding phase (50-90 cores).
+# A false "idle" is harmless while chunks are still growing — termination
+# requires BOTH conditions — so this errs high.
+IDLE_CORES = 30.0
+
+
+def _compose(*args: str, size: str, capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["docker", "compose", *args],
+        cwd=ROOT,
+        env={
+            **__import__("os").environ,
+            "BENCH_SIZE": size,
+        },
+        capture_output=capture,
+        text=True,
+        check=False,
+    )
+
+
+def _container_id(size: str, service: str) -> str:
+    out = _compose("ps", "-q", service, size=size, capture=True).stdout.strip()
+    if not out:
+        raise RuntimeError(f"container for {service} not found")
+    return out
+
+
+def _proc_status(container: str) -> dict | None:
+    """VmRSS/VmHWM (kB) summed over ALL processes in the container.
+
+    With ``indexer.workers`` > 1 the container holds the spawn parent plus N
+    worker processes; the interesting number is their total footprint. The
+    summed VmHWM is an upper bound (individual peaks need not coincide); the
+    headline peak uses the sampled RSS total instead. Returns None once the
+    container has exited.
+    """
+
+    proc = subprocess.run(
+        ["docker", "exec", container, "python", "-c", PROC_SAMPLE],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    # Pss divides shared pages (e.g. the torch libraries mapped by every
+    # worker) proportionally, so its sum is the honest physical footprint;
+    # the VmRSS sum counts each shared page once per process.
+    values = {"VmRSS": 0, "VmHWM": 0, "Pss": 0}
+    rows = json.loads(proc.stdout)
+    for row in rows:
+        for key in values:
+            values[key] += row.get(key, 0)
+    values["processes"] = rows
+    return values
+
+
+def _proc_cpu_seconds(container: str) -> float | None:
+    """Total CPU seconds (utime+stime) over ALL processes in the container."""
+
+    proc = subprocess.run(
+        ["docker", "exec", container, "sh", "-c", "cat /proc/[0-9]*/stat"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    ticks = 0
+    for line in proc.stdout.splitlines():
+        fields = line.rsplit(")", 1)[-1].split()
+        if len(fields) > 12:
+            ticks += int(fields[11]) + int(fields[12])  # utime + stime
+    return ticks / 100.0  # USER_HZ is 100 on Linux
+
+
+def _embedder_description() -> str:
+    import yaml
+
+    embedder = yaml.safe_load((ROOT / "config.yaml").read_text()).get("embedder", {})
+    model = embedder.get("model", "?")
+    dims = embedder.get("truncate_dim")
+    return f"{model} (local{f', {dims} dims' if dims else ''})"
+
+
+def _wait_http(url: str, timeout: float, message: str) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if httpx.get(url, timeout=5).status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(1)
+    raise TimeoutError(message)
+
+
+def _accuracy(
+    base: str, questions: list[dict], k: int
+) -> tuple[int, int, list[dict]]:
+    hits = 0
+    misses: list[dict] = []
+    for q in questions:
+        resp = httpx.post(
+            f"{base}/api/v1/retrieve", json={"query": q["query"], "k": k}, timeout=120
+        )
+        resp.raise_for_status()
+        results = resp.json()["results"]
+        # expected_file may carry a subdir ("0001/0042-Title.txt"); match on
+        # the full path suffix, not the basename, to survive sharded corpora.
+        paths = [r["metadata"].get("path", "") for r in results]
+        if any(p.endswith("/" + q["expected_file"]) for p in paths):
+            hits += 1
+        else:
+            misses.append(
+                {
+                    "expected": q["expected_file"],
+                    "query": q["query"][:120],
+                    "got": [str(Path(p).parent.name + "/" + Path(p).name) for p in paths],
+                }
+            )
+    return hits, len(questions), misses
+
+
+_FREE_EMBEDDERS = {"sentence_transformer", "sentencetransformer", "mock"}
+
+
+def _assert_zero_cost(config_path: Path) -> None:
+    """Refuse to run a benchmark that could spend anyone's API money.
+
+    The guarantee is enforced, not assumed: only local embedders are allowed,
+    no LLM section may be present (the bench never composes answers), and the
+    OPENAI_API_KEY passed to containers must be the literal dummy "x" from
+    docker-compose. Editing any of these fails loudly here, before a single
+    container starts.
+    """
+
+    import yaml
+
+    config = yaml.safe_load(config_path.read_text())
+    embedder = (config.get("embedder") or {}).get("type", "")
+    if embedder not in _FREE_EMBEDDERS:
+        raise SystemExit(
+            f"zero-cost guard: benchmark config uses embedder {embedder!r}; "
+            f"only local embedders {sorted(_FREE_EMBEDDERS)} are allowed"
+        )
+    if config.get("llm"):
+        raise SystemExit(
+            "zero-cost guard: benchmark config must not define an 'llm' "
+            "section (the bench only measures indexing and /retrieve)"
+        )
+    compose = (config_path.parent / "docker-compose.yml").read_text()
+    if "OPENAI_API_KEY: x" not in compose:
+        raise SystemExit(
+            "zero-cost guard: docker-compose must hard-pin OPENAI_API_KEY "
+            "to the dummy value 'x' so no real key can leak into containers"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--size", default="100mb", help="datasets/<size> to index")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--server-port", type=int, default=8300)
+    parser.add_argument("--qdrant-port", type=int, default=8301)
+    parser.add_argument("--keep-up", action="store_true", help="don't docker compose down")
+    parser.add_argument('--expected-chunks', type=int,
+                        help='Optional exact output count for a frozen corpus; validates completeness')
+    args = parser.parse_args()
+
+    import os as _os
+
+    _assert_zero_cost(ROOT / "config.yaml")
+    data_root = Path(_os.environ.get("BENCH_DATA_ROOT", ROOT / "datasets"))
+    dataset = data_root / args.size
+    docs_count = sum(1 for _ in (dataset / "docs").rglob("*.txt"))
+    questions = json.loads((dataset / "questions.json").read_text())
+    results_dir = ROOT / "results"
+    results_dir.mkdir(exist_ok=True)
+    # Save the resolved setup without the license secret.
+    compose_config = _compose("config", "--format", "json", size=args.size, capture=True)
+    if compose_config.returncode:
+        raise SystemExit(compose_config.stderr)
+    resolved = json.loads(compose_config.stdout)
+    for service in resolved["services"].values():
+        env = service.get("environment", {})
+        if "PATHWAY_LICENSE_KEY" in env:
+            env["PATHWAY_LICENSE_KEY"] = "<redacted>"
+    (results_dir / f"{args.size}-compose.json").write_text(json.dumps(resolved, indent=2))
+
+    import os
+
+    os.environ["BENCH_SERVER_PORT"] = str(args.server_port)
+    os.environ["BENCH_QDRANT_PORT"] = str(args.qdrant_port)
+
+    print(f"== dataset {args.size}: {docs_count} files, {len(questions)} questions")
+    # Always start from a clean slate — leftovers from an interrupted run
+    # (a pre-filled Qdrant, an old indexer) would silently corrupt every
+    # measurement.
+    _compose("down", "-v", size=args.size)
+
+    # Pre-warm the HF model cache on the host: containers run HF_HUB_OFFLINE.
+    import yaml as _yaml
+
+    bench_config = _yaml.safe_load((ROOT / "config.yaml").read_text())
+    model = bench_config["embedder"].get(
+        "model"
+    )
+    if model:
+        # Filesystem check first: lock-free (old runs left root-owned lock
+        # files in the mounted cache), and offline containers only need the
+        # snapshot to exist.
+        snapshots = (
+            Path.home()
+            / ".cache/huggingface/hub"
+            / ("models--" + model.replace("/", "--"))
+            / "snapshots"
+        )
+        if not (snapshots.exists() and any(snapshots.iterdir())):
+            from huggingface_hub import snapshot_download
+
+            print(f"== pre-warming model cache: {model}")
+            snapshot_download(model)
+
+    _compose("up", "-d", "qdrant", size=args.size)
+    _wait_http(
+        f"http://127.0.0.1:{args.qdrant_port}/readyz", 120, "qdrant not ready"
+    )
+
+    started = time.monotonic()
+    _compose("up", "-d", "indexer", "server", size=args.size)
+    indexer = _container_id(args.size, "indexer")
+    base = f"http://127.0.0.1:{args.server_port}"
+    _wait_http(f"{base}/api/v1/health", 180, "server not ready")
+
+    def _chunks() -> int | None:
+        try:
+            response = httpx.get(f"{base}/api/v1/stats", timeout=10)
+            response.raise_for_status()
+            value = response.json().get("chunks")
+            return int(value) if value is not None else None
+        except (httpx.HTTPError, ValueError):
+            return None
+
+    # The indexer runs in its product mode — STREAMING — and never exits, so
+    # "indexing finished" is detected by the chunk counter going stable: it
+    # grew at least once and has not changed for STABLE_WINDOW seconds.
+    # Indexing time = the moment of the last observed increase.
+    # The CSV is appended live, so an interrupted run keeps its memory curve.
+    csv_path = results_dir / f"{args.size}-memory.csv"
+    csv_path.write_text("elapsed_s,rss_mb,hwm_mb,pss_mb,chunks\n")
+    process_path = results_dir / f"{args.size}-processes.jsonl.gz"
+    peak_processes = []
+    peak_pss_kb = -1
+    verified_exact_count = None
+    with _ParsingProgress(indexer) as parsing, gzip.open(process_path, "wt") as process_log:
+
+        samples: list[tuple[float, int, int, int, int]] = []  # (s, rss, hwm, pss, chunks)
+        last_count = 0
+        last_change = started
+        last_busy = started
+        prev_cpu: float | None = None
+        prev_time = started
+        cpu_seconds: float | None = None
+        while True:
+            status = _proc_status(indexer)
+            if status is None:
+                _compose("logs", "--tail", "50", "indexer", size=args.size)
+                raise SystemExit("indexer container exited unexpectedly")
+            now = time.monotonic()
+            count = _chunks()
+            if parsing.failed_documents or parsing.reader_error:
+                raise RuntimeError('Input parsing failed or its progress could not be observed')
+            if parsing.process.poll() is not None:
+                raise RuntimeError('Input progress log stream ended unexpectedly')
+            if count is None:
+                # An unavailable stats endpoint is not evidence of inactivity.
+                last_busy = now
+            elif count > last_count:
+                last_count = count
+                last_change = now
+            cpu = _proc_cpu_seconds(indexer)
+            if cpu is not None:
+                if (prev_cpu is not None and now > prev_time
+                        and (cpu - prev_cpu) / (now - prev_time) >= IDLE_CORES):
+                    last_busy = now
+                prev_cpu, prev_time, cpu_seconds = cpu, now, cpu
+            last_busy = max(last_busy, parsing.last_change)
+            elapsed = now - started
+            sample = (
+                elapsed,
+                status.get("VmRSS", 0),
+                status.get("VmHWM", 0),
+                status.get("Pss", 0),
+                last_count,
+            )
+            samples.append(sample)
+            process_log.write(json.dumps({"elapsed_s": elapsed, "processes": status["processes"],
+                                          "parsed_documents": parsing.parsed_documents,
+                                          "observed_chunks": count}) + "\n")
+            process_log.flush()
+            if sample[3] > peak_pss_kb:
+                peak_pss_kb = sample[3]
+                peak_processes = status["processes"]
+            with csv_path.open("a") as fh:
+                fh.write(
+                    f"{sample[0]:.1f},{sample[1] / 1024:.1f},{sample[2] / 1024:.1f},"
+                    f"{sample[3] / 1024:.1f},{sample[4]}\n"
+                )
+            print(
+                f"\r   t={elapsed:7.0f}s  rss={status.get('VmRSS', 0) / 1024:7.1f} MB  "
+                f"peak={status.get('VmHWM', 0) / 1024:7.1f} MB  chunks={last_count} "
+                f"parsed={parsing.parsed_documents}/{docs_count}",
+                end="",
+                flush=True,
+            )
+            if _ready_to_finish(documents=docs_count, parsed_documents=parsing.parsed_documents,
+                                chunks=last_count, last_change=last_change, last_busy=last_busy,
+                                now=now, stats_available=count is not None):
+                if args.expected_chunks is not None:
+                    collection = bench_config['vector_db']['collection']
+                    response = httpx.post(
+                        f'http://127.0.0.1:{args.qdrant_port}/collections/{collection}/points/count',
+                        json={'exact': True}, timeout=120)
+                    response.raise_for_status()
+                    verified_exact_count = response.json()['result']['count']
+                    if verified_exact_count > args.expected_chunks:
+                        raise RuntimeError('Output exceeds the expected frozen-corpus point count')
+                    if verified_exact_count < args.expected_chunks:
+                        last_busy = time.monotonic()
+                        time.sleep(SAMPLE_INTERVAL)
+                        continue
+                    (results_dir / f"{args.size}-postrun-qdrant.json").write_text(
+                        json.dumps({"exact_count": response.json()}, indent=2) + "\n")
+                break
+            time.sleep(SAMPLE_INTERVAL)
+        print()
+    duration = last_change - started
+
+    # Vector-DB footprint: on-disk storage inside the qdrant container.
+    qdrant = _container_id(args.size, "qdrant")
+    du = subprocess.run(
+        ["docker", "exec", qdrant, "du", "-sb", "/qdrant/storage"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    db_bytes = int(du.stdout.split()[0]) if du.returncode == 0 and du.stdout else None
+
+    stats = httpx.get(f"{base}/api/v1/stats", timeout=60).json()
+    hits, total, misses = _accuracy(base, questions, args.top_k)
+
+    # Peak = highest sampled TOTAL RSS across the container's processes (the
+    # summed VmHWM in the CSV is only an upper bound for multi-process runs).
+    peak_mb = max(s[1] for s in samples) / 1024 if samples else 0.0
+    peak_pss_mb = max(s[3] for s in samples) / 1024 if samples else 0.0
+    size_mb = sum(
+        f.stat().st_size for f in (dataset / "docs").rglob("*.txt")
+    ) / 1024 / 1024
+    summary = {
+        "dataset": args.size,
+        "corpus_mb": round(size_mb, 1),
+        "documents": docs_count,
+        "parsed_documents": parsing.parsed_documents,
+        "expected_chunks": args.expected_chunks,
+        "verified_exact_chunks": verified_exact_count,
+        "chunks": stats.get("chunks"),
+        "max_observed_chunks": last_count,
+        "chunk_count_metric": "Qdrant approximate count at completion; CSV chunks is the maximum observed count",
+        "indexing_seconds": round(duration, 1),
+        "throughput_mb_per_min": round(size_mb / (duration / 60), 2),
+        "peak_rss_mb": round(peak_mb, 1),
+        # Honest physical peak: shared pages divided among processes.
+        "peak_pss_mb": round(peak_pss_mb, 1),
+        "peak_processes": peak_processes,
+        "peak_elapsed_s": max(samples, key=lambda s: s[3])[0],
+        "jemalloc_conf": os.environ.get("BENCH_JEMALLOC_CONF", ""),
+        "omp_threads": int(os.environ.get("BENCH_OMP_THREADS", "12")),
+        "indexer_cpu_seconds": round(cpu_seconds, 1) if cpu_seconds else None,
+        "avg_parallelism": round(cpu_seconds / duration, 1) if cpu_seconds else None,
+        "vector_db_disk_mb": round(db_bytes / 1024 / 1024, 1) if db_bytes else None,
+        "qdrant_image_id": subprocess.check_output(
+            ["docker", "inspect", "--format", "{{.Image}}", qdrant], text=True
+        ).strip(),
+        "vector_db_mb_per_corpus_mb": (
+            round(db_bytes / 1024 / 1024 / size_mb, 2) if db_bytes else None
+        ),
+        "retrieval_accuracy": f"{hits}/{total}",
+        "embedder": _embedder_description(),
+        # Standard text page ≈ 2000 characters (≈ bytes for English text).
+        "approx_text_pages": int(size_mb * 1024 * 1024 / 2000),
+        # Which questions missed top-k, with what came back instead.
+        "accuracy_misses": misses,
+    }
+    (results_dir / f"{args.size}-summary.json").write_text(json.dumps(summary, indent=2))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    minutes = [s[0] / 60 for s in samples]
+    ax.plot(minutes, [s[3] / 1024**2 for s in samples], label="indexer PSS", linewidth=1.8)
+    ax.axhline(peak_pss_mb / 1024, linestyle="--", linewidth=1, alpha=0.6, label=f"peak {peak_pss_mb / 1024:.2f} GiB")
+    ax.set_xlabel("minutes since start")
+    ax.set_ylabel("memory (PSS), GiB")
+    ax.set_ylim(bottom=0)
+    ax2 = ax.twinx()
+    ax2.plot(minutes, [s[4] for s in samples], color="tab:green", alpha=0.6, linewidth=1.4, label="maximum observed chunks")
+    ax2.set_ylabel("maximum observed chunks")
+    ax2.set_ylim(bottom=0)
+    ax.set_title(f"serviette indexer — {args.size} corpus ({docs_count} docs, streaming)")
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="center right")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    plot_path = results_dir / f"{args.size}-memory.png"
+    fig.savefig(plot_path, dpi=130)
+
+    print(json.dumps(summary, indent=2))
+    print(f"plot: {plot_path}\ncsv:  {csv_path}")
+
+    logs = _compose("logs", "--no-color", "indexer", size=args.size, capture=True)
+    with gzip.open(results_dir / f"{args.size}-indexer.txt.gz", "wt") as fh:
+        fh.write(logs.stdout)
+        fh.write(logs.stderr)
+
+    if not args.keep_up:
+        _compose("down", "-v", size=args.size)
+
+
+if __name__ == "__main__":
+    main()
